@@ -1,0 +1,11 @@
+openai-whisper
+yt-dlp
+streamlit
+langchain
+langchain-groq
+groq
+python-dotenv
+faiss-cpu
+tiktoken
+ffmpeg-python
+imageio[ffmpeg]
