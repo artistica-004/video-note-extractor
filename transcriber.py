@@ -1,95 +1,79 @@
-import yt_dlp
-import os
-import imageio_ffmpeg
-from groq import Groq
-from dotenv import load_dotenv
+from youtube_transcript_api import YouTubeTranscriptApi, FetchedTranscript
+from youtube_transcript_api._api import YouTubeTranscriptApi as YTApi
+import re
 
-load_dotenv()
-
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-
-
-def download_audio(youtube_url):
-    print("⏬ Downloading audio from YouTube...")
-    
-    ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-    ffmpeg_dir = os.path.dirname(ffmpeg_exe)
-    
-    ydl_opts = {
-        'format': 'worstaudio/worst',
-        'outtmpl': 'audio.%(ext)s',
-        'quiet': False,
-        'ffmpeg_location': ffmpeg_dir,
-    }
-    
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(youtube_url, download=True)
-        ext = info.get('ext', 'webm')
-        audio_file = f"audio.{ext}"
-    
-    print(f"✅ Audio downloaded as {audio_file}!")
-    return audio_file
-
-
-def transcribe_audio(audio_path):
-    print("🎙️ Transcribing using Groq Whisper API...")
-    
-    file_size = os.path.getsize(audio_path) / (1024 * 1024)
-    print(f"📁 File size: {file_size:.1f} MB")
-    
-    if file_size > 40:
-        raise Exception("File too large! Please try a shorter video.")
-    
-    with open(audio_path, "rb") as audio_file:
-        transcription = client.audio.transcriptions.create(
-            model="whisper-large-v3-turbo",
-            file=(os.path.basename(audio_path), audio_file),
-            response_format="verbose_json",
-            timestamp_granularities=["segment"]
-        )
-    
-    print("✅ Transcription complete!")
-    print(f"📝 Text preview: {transcription.text[:200] if transcription.text else 'EMPTY!'}")
-    
-    segments = []
-    if hasattr(transcription, 'segments') and transcription.segments:
-        for seg in transcription.segments:
-            if isinstance(seg, dict):
-                segments.append({
-                    'start': seg.get('start', 0),
-                    'end': seg.get('end', 0),
-                    'text': seg.get('text', '')
-                })
-            else:
-                segments.append({
-                    'start': seg.start,
-                    'end': seg.end,
-                    'text': seg.text
-                })
-    
-    result = {
-        "full_text": transcription.text if transcription.text else "",
-        "segments": segments
-    }
-    
-    print(f"✅ Returning result with {len(result['full_text'])} characters!")
-    return result
+def get_video_id(youtube_url):
+    """Extracts video ID from any YouTube URL format"""
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
+        r'(?:embed\/)([0-9A-Za-z_-]{11})'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, youtube_url)
+        if match:
+            return match.group(1)
+    raise Exception("Could not extract video ID! Please check your YouTube link.")
 
 
 def process_video(youtube_url):
-    print("🎬 Starting process_video...")
+    """Fetches transcript directly from YouTube captions"""
     
-    audio_path = download_audio(youtube_url)
+    print("🔍 Extracting video ID...")
+    video_id = get_video_id(youtube_url)
+    print(f"✅ Video ID: {video_id}")
     
-    print(f"🎵 Audio file exists: {os.path.exists(audio_path)}")
+    print("📜 Fetching transcript from YouTube...")
     
-    transcription = transcribe_audio(audio_path)
+    try:
+        ytt = YouTubeTranscriptApi()
+        transcript_list = ytt.fetch(video_id)
+        entries = list(transcript_list)
+        
+    except Exception as e1:
+        print(f"First attempt failed: {e1}")
+        try:
+            # Try older API style
+            entries = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = entries.find_transcript(['en', 'en-US', 'en-GB'])
+            entries = transcript.fetch()
+            entries = list(entries)
+        except Exception as e2:
+            print(f"Second attempt failed: {e2}")
+            raise Exception(
+                "No captions found for this video! "
+                "Please try a video with subtitles enabled. "
+                f"Details: {str(e2)}"
+            )
     
-    print(f"📋 Transcription received: {type(transcription)}")
-    print(f"📋 Full text length: {len(transcription['full_text'])}")
+    print(f"✅ Got {len(entries)} transcript entries!")
     
-    if os.path.exists(audio_path):
-        os.remove(audio_path)
-        print("🗑️ Cleaned up audio file!")
+    # Build full text
+    full_text = " ".join([
+        entry.get('text', '') if isinstance(entry, dict) else str(entry.text)
+        for entry in entries
+    ])
     
-    return transcription
+    # Build segments
+    segments = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            segments.append({
+                'start': entry.get('start', 0),
+                'end': entry.get('start', 0) + entry.get('duration', 0),
+                'text': entry.get('text', '')
+            })
+        else:
+            segments.append({
+                'start': entry.start,
+                'end': entry.start + getattr(entry, 'duration', 0),
+                'text': entry.text
+            })
+    
+    print(f"✅ Got {len(full_text)} characters!")
+    print(f"📝 Preview: {full_text[:200]}")
+    
+    return {
+        "full_text": full_text,
+        "segments": segments
+    }
