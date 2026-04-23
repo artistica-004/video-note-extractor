@@ -1,3 +1,14 @@
+---
+title: Video Note Extractor
+emoji: 🎬
+colorFrom: purple
+colorTo: blue
+sdk: streamlit
+sdk_version: 1.28.0
+app_file: app.py
+pinned: false
+---
+
 # 🎬 Video Note Extractor
 
 > **Convert any YouTube video into organized notes instantly using AI.**
@@ -23,10 +34,8 @@ Simply paste a YouTube link and it automatically transcribes the audio, generate
 |---|---|
 | Python 3.13 | Core programming language |
 | Streamlit | Web interface |
-| Groq Whisper API | Speech-to-text transcription |
+| Requests | HTTP requests for caption fetching |
 | Groq LLaMA (llama-3.1-8b-instant) | Notes & summary generation |
-| yt-dlp | YouTube audio downloading |
-| imageio-ffmpeg | Audio processing |
 | python-dotenv | API key management |
 
 ---
@@ -73,10 +82,10 @@ http://localhost:8501
 ## 🚀 How to Use
 
 1. Paste any YouTube URL into the input box
-2. Click **"🚀 Extract Notes!"**
+2. Click **"Extract Notes!"**
 3. Wait under 1 minute for AI to process
 4. View results across 4 tabs — Notes, Timestamps, Action Items, Full Transcript
-5. Click **"⬇️ Download Notes as .txt"** to save
+5. Click **"Download Notes as .txt"** to save
 
 ---
 
@@ -86,7 +95,7 @@ http://localhost:8501
 video-note-extractor/
 │
 ├── app.py                 # Main Streamlit web interface
-├── transcriber.py         # Downloads & transcribes YouTube audio
+├── transcriber.py         # Fetches YouTube captions directly
 ├── notes_generator.py     # AI generates notes, timestamps & tasks
 ├── requirements.txt       # Python dependencies
 ├── .env                   # API key (never uploaded to GitHub)
@@ -96,24 +105,13 @@ video-note-extractor/
 
 ---
 
-## ⚠️ Hosting Limitations
-
-This project **runs perfectly on a local machine** but cannot be hosted on free cloud platforms (Hugging Face, Streamlit Cloud etc.) because they block all outbound connections to YouTube.
-
-**Workaround:** YouTube has a built-in transcript feature. You can copy the transcript manually and paste it into the app — the AI notes generation works perfectly with pasted text too.
-
-> Steps: Open YouTube video → Click `...` → Show Transcript → Copy text → Paste into app
-
----
-
 ## 📦 Requirements
 
 ```
 streamlit
 groq
 python-dotenv
-yt-dlp
-imageio-ffmpeg
+requests
 ```
 
 ---
