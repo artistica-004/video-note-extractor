@@ -1,7 +1,11 @@
-import yt_dlp
+from youtube_transcript_api import YouTubeTranscriptApi
 import re
-import os
-import json
+import urllib3
+
+# Disable SSL warnings and verification for Hugging Face environment
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
 
 def get_video_id(youtube_url):
     """Extracts video ID from any YouTube URL format"""
@@ -18,68 +22,49 @@ def get_video_id(youtube_url):
 
 
 def process_video(youtube_url):
-    """Fetches subtitles using yt-dlp — works on Hugging Face!"""
-    
+    """Fetches subtitles/captions using youtube-transcript-api — works on Hugging Face!"""
+
     print("🔍 Getting video ID...")
     video_id = get_video_id(youtube_url)
     print(f"✅ Video ID: {video_id}")
 
-    print("📜 Fetching subtitles...")
-
-    # yt-dlp options to download ONLY subtitles (no audio/video!)
-    ydl_opts = {
-        'skip_download': True,          # Don't download video/audio!
-        'writesubtitles': True,         # Download manual subtitles
-        'writeautomaticsub': True,      # Download auto-generated subtitles
-        'subtitleslangs': ['en', 'en-US', 'en-GB'],
-        'subtitlesformat': 'json3',     # JSON format - easy to parse
-        'outtmpl': f'subtitle_{video_id}',
-        'quiet': True,
-    }
-
-    subtitle_file = None
+    print("📜 Fetching captions...")
 
     try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([youtube_url])
+        # Try to get English transcripts (manual or auto-generated)
+        transcripts = None
 
-        # Find the downloaded subtitle file
-        for ext in ['en.json3', 'en-US.json3', 'en-GB.json3']:
-            fname = f'subtitle_{video_id}.{ext}'
-            if os.path.exists(fname):
-                subtitle_file = fname
-                break
+        try:
+            transcripts = YouTubeTranscriptApi.get_transcript(video_id, languages=['en'])
+            print("✅ English captions found (manual)")
+        except Exception as e1:
+            print(f"⚠️ Manual captions not available ({str(e1)[:50]}), trying auto-generated...")
+            try:
+                transcripts = YouTubeTranscriptApi.get_transcript(video_id, languages=['en-US'])
+                print("✅ Auto-generated captions found (en-US)")
+            except Exception as e2:
+                try:
+                    transcripts = YouTubeTranscriptApi.get_transcript(video_id)
+                    print("✅ Found captions in default language")
+                except Exception as e3:
+                    raise Exception(f"Could not fetch any captions. Tried: en, en-US, default. Last error: {str(e3)}")
 
-        if not subtitle_file:
-            raise Exception("No subtitle file downloaded!")
+        if not transcripts:
+            raise Exception("No captions/transcripts available!")
 
-        print(f"✅ Subtitle file found: {subtitle_file}")
-
-        # Parse the JSON3 subtitle file
-        with open(subtitle_file, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-
+        # Process transcripts into segments
         entries = []
-        for event in data.get('events', []):
-            if 'segs' not in event:
-                continue
-            text = ''.join(seg.get('utf8', '') for seg in event['segs'])
-            text = text.strip().replace('\n', ' ')
+        for item in transcripts:
+            text = item.get('text', '').strip()
             if text:
-                start = event.get('tStartMs', 0) / 1000
-                duration = event.get('dDurationMs', 0) / 1000
                 entries.append({
                     'text': text,
-                    'start': start,
-                    'end': start + duration
+                    'start': item.get('start', 0),
+                    'end': item.get('start', 0) + item.get('duration', 0)
                 })
 
-        # Clean up subtitle file
-        if subtitle_file and os.path.exists(subtitle_file):
-            os.remove(subtitle_file)
-
         if not entries:
-            raise Exception("Subtitle file was empty!")
+            raise Exception("Transcript is empty!")
 
         full_text = ' '.join([e['text'] for e in entries])
         segments = [
@@ -100,11 +85,23 @@ def process_video(youtube_url):
         }
 
     except Exception as e:
-        # Clean up any subtitle files
-        for f in os.listdir('.'):
-            if f.startswith(f'subtitle_{video_id}'):
-                os.remove(f)
-        raise Exception(
-            f"Could not fetch subtitles! Please try a video "
-            f"that has English captions enabled. Error: {str(e)}"
-        )
+        error_msg = str(e).lower()
+
+        if 'no transcript' in error_msg or 'unavailable' in error_msg:
+            raise Exception(
+                f"❌ This video has NO captions/subtitles available. "
+                f"Please try a different video with English captions enabled."
+            )
+        elif 'invalid' in error_msg or 'not found' in error_msg:
+            raise Exception(
+                f"❌ Invalid YouTube URL or video not found. Please check the URL."
+            )
+        elif 'ssl' in error_msg or 'certificate' in error_msg or 'eof' in error_msg:
+            raise Exception(
+                f"❌ Network connection error. This is a Hugging Face environment issue. "
+                f"Please try again in a few seconds or try a different video."
+            )
+        else:
+            raise Exception(
+                f"Error fetching captions: {str(e)}"
+            )
