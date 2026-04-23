@@ -1,56 +1,8 @@
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api._clients import _RequestsClient
 import re
-import urllib3
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-# Disable SSL warnings and verification for Hugging Face environment
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-import ssl
-ssl._create_default_https_context = ssl._create_unverified_context
-
-# Custom HTTP client with better headers and retries
-class CustomRequestsClient(_RequestsClient):
-    def __init__(self):
-        self.session = requests.Session()
-
-        # Set up retries
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[429, 500, 502, 503, 504],
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-
-        # Better headers
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate',
-            'DNT': '1',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Cache-Control': 'max-age=0',
-        })
-
-    def make_request(self, endpoint, additional_params=None, headers=None):
-        if headers is None:
-            headers = {}
-
-        try:
-            response = self.session.get(endpoint, params=additional_params, headers=headers, timeout=30, verify=False)
-            response.raise_for_status()
-            return response
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"Network error: {str(e)}")
+import json
+import urllib.parse
+import time
 
 def get_video_id(youtube_url):
     """Extracts video ID from any YouTube URL format"""
@@ -66,79 +18,186 @@ def get_video_id(youtube_url):
     raise Exception("Invalid YouTube URL!")
 
 
-def process_video(youtube_url):
-    """Fetches subtitles/captions using youtube-transcript-api with custom HTTP client"""
+def fetch_captions_from_youtube(video_id):
+    """Fetch captions directly from YouTube's servers"""
 
-    print("🔍 Getting video ID...")
-    video_id = get_video_id(youtube_url)
-    print(f"✅ Video ID: {video_id}")
+    print(f"[*] Fetching caption data for video: {video_id}")
 
-    print("📜 Fetching captions...")
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
 
     try:
-        # Use custom client with better headers and retries
-        custom_client = CustomRequestsClient()
+        # Step 1: Get video page to find caption tracks
+        print("[*] Getting video page...")
+        video_url = f"https://www.youtube.com/watch?v={video_id}"
 
-        try:
-            transcripts = YouTubeTranscriptApi.get_transcript(
-                video_id,
-                languages=['en'],
-                http_client=custom_client
-            )
-            print("✅ English captions found (manual)")
-        except Exception as e1:
-            print(f"⚠️ Manual captions not available, trying auto-generated...")
+        session = requests.Session()
+        session.headers.update(headers)
+
+        response = session.get(video_url, timeout=15, verify=False)
+        response.raise_for_status()
+
+        # Extract caption track data from initial data
+        html = response.text
+
+        # Find the initial data JSON in the page
+        match = re.search(r'var ytInitialData = ({.*?});', html)
+        if not match:
+            match = re.search(r'"captions":\{"playerCaptionsTracklistRenderer":(.*?),"', html)
+
+        if not match:
+            raise Exception("Could not find caption data in page")
+
+        print("[+] Found caption tracks")
+
+        # Try to extract caption URLs from the response
+        caption_tracks = re.findall(r'"url":"(.*?caption[^"]*)"', html)
+
+        if not caption_tracks:
+            # Try another pattern
+            caption_tracks = re.findall(r'caption_tracks":\[\{"baseUrl":"([^"]+)"', html)
+
+        if not caption_tracks:
+            raise Exception("No caption tracks found")
+
+        print(f"[+] Found {len(caption_tracks)} caption track(s)")
+
+        # Step 2: Fetch the actual captions
+        for caption_url in caption_tracks:
             try:
-                transcripts = YouTubeTranscriptApi.get_transcript(
-                    video_id,
-                    languages=['en-US'],
-                    http_client=custom_client
-                )
-                print("✅ Auto-generated captions found (en-US)")
-            except Exception as e2:
-                print(f"⚠️ Trying any available language...")
-                try:
-                    # Get all available transcripts and pick first English one
-                    all_transcripts = YouTubeTranscriptApi.list_transcripts(video_id, http_client=custom_client)
+                # Decode URL if needed
+                caption_url = caption_url.replace('\\u0026', '&')
 
-                    # Try English first, then fallback
-                    for lang in ['en', 'en-US', 'en-GB']:
-                        try:
-                            transcript_obj = all_transcripts.find_transcript([lang])
-                            transcripts = transcript_obj.fetch()
-                            print(f"✅ Found captions in {lang}")
-                            break
-                        except:
-                            continue
-                    else:
-                        # If no English, get any available
-                        if all_transcripts.manually_created_transcripts:
-                            transcripts = all_transcripts.manually_created_transcripts[0].fetch()
-                        elif all_transcripts.generated_transcripts:
-                            transcripts = all_transcripts.generated_transcripts[0].fetch()
-                        else:
-                            raise Exception("No transcripts available for this video")
+                print(f"[*] Downloading captions from: {caption_url[:50]}...")
 
-                except Exception as e3:
-                    raise Exception(f"Could not fetch any captions after 3 attempts. Last error: {str(e3)}")
+                cap_response = session.get(caption_url, timeout=15, verify=False)
+                cap_response.raise_for_status()
 
-        if not transcripts:
-            raise Exception("No captions/transcripts available!")
+                # Parse VTT or XML format
+                captions_text = cap_response.text
 
-        # Process transcripts into segments
-        entries = []
-        for item in transcripts:
-            text = item.get('text', '').strip()
+                if 'WEBVTT' in captions_text or 'Kind: captions' in captions_text:
+                    # VTT format
+                    print("[+] Got VTT format captions")
+                    entries = parse_vtt(captions_text)
+                elif captions_text.strip().startswith('<?xml'):
+                    # XML format
+                    print("[+] Got XML format captions")
+                    entries = parse_xml(captions_text)
+                else:
+                    continue
+
+                if entries:
+                    return entries
+
+            except Exception as e:
+                print(f"[-] Failed to fetch from this track: {str(e)}")
+                continue
+
+        raise Exception("Could not fetch captions from any track")
+
+    except Exception as e:
+        raise Exception(f"Caption fetch failed: {str(e)}")
+
+
+def parse_vtt(vtt_text):
+    """Parse VTT format captions"""
+    entries = []
+    lines = vtt_text.split('\n')
+
+    current_time = None
+    current_text = []
+
+    for line in lines:
+        line = line.strip()
+
+        if '-->' in line:
+            # Parse timestamp
+            try:
+                start_str = line.split('-->')[0].strip()
+                start = vtt_time_to_seconds(start_str)
+                current_time = start
+            except:
+                pass
+        elif line and current_time is not None and '-->' not in line:
+            # This is caption text
+            if line != 'WEBVTT' and not line.startswith('Kind:') and not line.startswith('Language:'):
+                current_text.append(line)
+        elif not line and current_text:
+            # Empty line - end of caption block
+            text = ' '.join(current_text)
+            if text.strip():
+                entries.append({
+                    'text': text.strip(),
+                    'start': current_time,
+                    'end': current_time + 5
+                })
+            current_text = []
+            current_time = None
+
+    return entries
+
+
+def parse_xml(xml_text):
+    """Parse XML format captions"""
+    entries = []
+
+    try:
+        from xml.etree import ElementTree as ET
+
+        root = ET.fromstring(xml_text)
+
+        # Find all text elements
+        for item in root.findall('.//p'):
+            text = ''.join(item.itertext()).strip()
             if text:
+                start = float(item.get('t', 0)) / 1000  # Convert to seconds
+                duration = float(item.get('d', 5000)) / 1000
+
                 entries.append({
                     'text': text,
-                    'start': item.get('start', 0),
-                    'end': item.get('start', 0) + item.get('duration', 0)
+                    'start': start,
+                    'end': start + duration
                 })
+    except Exception as e:
+        raise Exception(f"XML parsing failed: {str(e)}")
+
+    return entries
+
+
+def vtt_time_to_seconds(time_str):
+    """Convert VTT timestamp to seconds"""
+    try:
+        parts = time_str.replace(',', '.').split(':')
+        if len(parts) == 3:
+            hours, minutes, seconds = parts
+            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+        elif len(parts) == 2:
+            minutes, seconds = parts
+            return int(minutes) * 60 + float(seconds)
+    except:
+        pass
+    return 0
+
+
+def process_video(youtube_url):
+    """Main function to process YouTube video and extract captions"""
+
+    print("[*] Getting video ID...")
+    video_id = get_video_id(youtube_url)
+    print(f"[+] Video ID: {video_id}")
+
+    print("[*] Fetching captions...")
+
+    try:
+        # Fetch captions directly from YouTube
+        entries = fetch_captions_from_youtube(video_id)
 
         if not entries:
-            raise Exception("Transcript is empty!")
+            raise Exception("No caption entries found")
 
+        # Process entries
         full_text = ' '.join([e['text'] for e in entries])
         segments = [
             {
@@ -149,8 +208,8 @@ def process_video(youtube_url):
             for e in entries
         ]
 
-        print(f"✅ {len(full_text)} characters fetched!")
-        print(f"📝 Preview: {full_text[:200]}")
+        print(f"[+] {len(full_text)} characters fetched!")
+        print(f"[*] Preview: {full_text[:200]}")
 
         return {
             "full_text": full_text,
@@ -159,21 +218,6 @@ def process_video(youtube_url):
 
     except Exception as e:
         error_msg = str(e).lower()
-
-        if 'no transcript' in error_msg or 'unavailable' in error_msg:
-            raise Exception(
-                f"❌ This video has NO captions/subtitles available. "
-                f"Please try a different video with English captions enabled."
-            )
-        elif 'invalid' in error_msg or 'not found' in error_msg:
-            raise Exception(
-                f"❌ Invalid YouTube URL or video not found. Please check the URL."
-            )
-        elif 'ssl' in error_msg or 'certificate' in error_msg or 'eof' in error_msg or 'network' in error_msg:
-            raise Exception(
-                f"❌ Network connection error. Please try again in a few seconds."
-            )
-        else:
-            raise Exception(
-                f"Error fetching captions: {str(e)}"
-            )
+        raise Exception(
+            f"Error extracting captions: {str(e)}"
+        )
