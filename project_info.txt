@@ -1,0 +1,10 @@
+I have built video-note-extractor which takes the yt video url and downloads the audio,transcibes using groq whisper api then uses a LLama lang model to automatically generate organized notes.
+
+Tech stack
+yt url
+FE- streamlit 
+yt-dlp downloads the audio
+imageio-ffmpeg 
+groq whisper api sst model 
+groq LLm
+python dotenv

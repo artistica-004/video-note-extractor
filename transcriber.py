@@ -1,377 +1,238 @@
+"""
+transcriber.py - Dual-mode transcript provider for Video Note Extractor.
+
+LOCAL mode       -> yt-dlp downloads the audio, Groq Whisper transcribes it.
+HUGGINGFACE mode -> the user pastes the YouTube transcript; we parse it here.
+
+Both modes return the SAME shape that notes_generator.process_transcription expects:
+    {"full_text": str, "segments": [{"start": float, "end": float, "text": str}, ...]}
+"""
+
+import os
 import re
-import requests
-import json
-import urllib.parse
-import time
-import urllib3
-from urllib3.util.retry import Retry
-from requests.adapters import HTTPAdapter
+import glob
+import socket
+import tempfile
 
-# Disable SSL warnings
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from dotenv import load_dotenv
 
-def get_video_id(youtube_url):
-    """Extracts video ID from any YouTube URL format"""
+load_dotenv()
+
+GROQ_WHISPER_MODEL = "whisper-large-v3-turbo"
+MAX_AUDIO_BYTES = 25 * 1024 * 1024  # Groq free-tier upload limit (25 MB)
+
+
+# --------------------------------------------------------------------------- #
+# Environment detection
+# --------------------------------------------------------------------------- #
+def youtube_reachable(timeout: float = 3.0) -> bool:
+    """Quick TCP check - can this machine open a connection to youtube.com:443?"""
+    try:
+        with socket.create_connection(("www.youtube.com", 443), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def detect_mode() -> str:
+    """
+    Returns "local" or "huggingface".
+
+    Priority:
+      1. APP_MODE env var ("local" / "huggingface") - manual override.
+      2. SPACE_ID env var - Hugging Face sets this automatically in every Space.
+      3. Fallback: if youtube.com is unreachable, use paste mode.
+    """
+    override = os.getenv("APP_MODE", "").strip().lower()
+    if override in ("local", "huggingface"):
+        return override
+
+    if os.getenv("SPACE_ID"):
+        return "huggingface"
+
+    return "local" if youtube_reachable() else "huggingface"
+
+
+# --------------------------------------------------------------------------- #
+# Shared helpers
+# --------------------------------------------------------------------------- #
+def get_video_id(youtube_url: str) -> str:
+    """Extract the 11-char video ID from watch / youtu.be / embed / shorts / live URLs."""
     patterns = [
-        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
-        r'(?:youtu\.be\/)([0-9A-Za-z_-]{11})',
-        r'(?:embed\/)([0-9A-Za-z_-]{11})'
+        r"(?:v=)([0-9A-Za-z_-]{11})",
+        r"(?:youtu\.be/)([0-9A-Za-z_-]{11})",
+        r"(?:embed/|shorts/|live/)([0-9A-Za-z_-]{11})",
     ]
     for pattern in patterns:
-        match = re.search(pattern, youtube_url)
+        match = re.search(pattern, youtube_url or "")
         if match:
             return match.group(1)
-    raise Exception("Invalid YouTube URL!")
+    raise ValueError("Invalid YouTube URL! Please check the link and try again.")
 
 
-def create_session_with_retries():
-    """Create a requests session with retry strategy"""
-    session = requests.Session()
-
-    retry_strategy = Retry(
-        total=5,
-        backoff_factor=2,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET", "HEAD"]
-    )
-
-    adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=1, pool_maxsize=1)
-    session.mount("https://", adapter)
-    session.mount("http://", adapter)
-
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate',
-        'DNT': '1',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1',
-        'Cache-Control': 'max-age=0',
-    })
-
-    return session
+def _build_result(segments: list) -> dict:
+    segments = [s for s in segments if s.get("text", "").strip()]
+    full_text = " ".join(s["text"].strip() for s in segments)
+    return {"full_text": full_text, "segments": segments}
 
 
-def fetch_captions_from_youtube(video_id):
-    """Fetch captions directly from YouTube's servers"""
-
-    print(f"[*] Fetching caption data for video: {video_id}")
-
+# --------------------------------------------------------------------------- #
+# LOCAL mode: yt-dlp + Groq Whisper
+# --------------------------------------------------------------------------- #
+def download_audio(youtube_url: str, out_dir: str) -> str:
+    """Download the smallest usable audio stream. No ffmpeg required."""
     try:
-        # Step 1: Get video page to find caption tracks
-        print("[*] Getting video page...")
-        video_url = f"https://www.youtube.com/watch?v={video_id}"
+        import yt_dlp
+    except ImportError as e:
+        raise RuntimeError(
+            "yt-dlp is not installed. Run: pip install -r requirements.txt"
+        ) from e
 
-        session = create_session_with_retries()
+    ydl_opts = {
+        # Prefer an audio-only stream under 25 MB; fall back to the smallest audio.
+        "format": "bestaudio[filesize<25M]/bestaudio[filesize_approx<25M]/worstaudio/bestaudio",
+        "outtmpl": os.path.join(out_dir, "audio.%(ext)s"),
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+    }
 
-        response = session.get(video_url, timeout=30, verify=False)
-        response.raise_for_status()
+    print("[*] Downloading audio with yt-dlp...")
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        ydl.download([youtube_url])
 
-        # Extract caption track data from initial data
-        html = response.text
-
-        print("[+] Found caption tracks")
-
-        # Try to extract caption URLs from the response
-        caption_tracks = re.findall(r'"url":"(.*?caption[^"]*)"', html)
-
-        if not caption_tracks:
-            # Try another pattern
-            caption_tracks = re.findall(r'caption_tracks":\[\{"baseUrl":"([^"]+)"', html)
-
-        if not caption_tracks:
-            # Try to find timedtext tracks
-            caption_tracks = re.findall(r'"baseUrl":"([^"]*timedtext[^"]*)"', html)
-
-        if not caption_tracks:
-            raise Exception("No caption tracks found in page")
-
-        print(f"[+] Found {len(caption_tracks)} caption track(s)")
-
-        # Step 2: Fetch the actual captions
-        for i, caption_url in enumerate(caption_tracks):
-            try:
-                # Decode URL if needed
-                caption_url = caption_url.replace('\\u0026', '&')
-
-                # Make sure URL is valid
-                if not caption_url.startswith('http'):
-                    caption_url = 'https://www.youtube.com' + caption_url
-
-                print(f"[*] Attempt {i+1}/{len(caption_tracks)}: Downloading captions...")
-
-                cap_response = session.get(caption_url, timeout=30, verify=False)
-                cap_response.raise_for_status()
-
-                # Parse VTT or XML format
-                captions_text = cap_response.text
-
-                if 'WEBVTT' in captions_text or 'Kind: captions' in captions_text:
-                    # VTT format
-                    print("[+] Got VTT format captions")
-                    entries = parse_vtt(captions_text)
-                elif captions_text.strip().startswith('<?xml'):
-                    # XML format
-                    print("[+] Got XML format captions")
-                    entries = parse_xml(captions_text)
-                else:
-                    print("[*] Unrecognized format, trying next...")
-                    continue
-
-                if entries and len(entries) > 0:
-                    print(f"[+] Successfully extracted {len(entries)} caption entries")
-                    return entries
-
-            except Exception as e:
-                print(f"[-] Attempt {i+1} failed: {str(e)[:100]}")
-                time.sleep(1)  # Wait before next attempt
-                continue
-
-        raise Exception("Could not fetch captions from any track after all attempts")
-
-    except Exception as e:
-        raise Exception(f"Caption fetch failed: {str(e)}")
+    files = glob.glob(os.path.join(out_dir, "audio.*"))
+    if not files:
+        raise RuntimeError("Audio download failed - no file was created.")
+    path = files[0]
+    print(f"[+] Downloaded {os.path.basename(path)} ({os.path.getsize(path) / 1e6:.1f} MB)")
+    return path
 
 
-def parse_vtt(vtt_text):
-    """Parse VTT format captions"""
-    entries = []
-    lines = vtt_text.split('\n')
+def transcribe_with_groq(audio_path: str) -> dict:
+    """Send the audio file to Groq Whisper and return the standard transcript dict."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY is missing. Add it to your .env file.")
 
-    current_time = None
-    current_text = []
-
-    for line in lines:
-        line = line.strip()
-
-        if '-->' in line:
-            # Parse timestamp
-            try:
-                start_str = line.split('-->')[0].strip()
-                start = vtt_time_to_seconds(start_str)
-                current_time = start
-            except:
-                pass
-        elif line and current_time is not None and '-->' not in line:
-            # This is caption text
-            if line != 'WEBVTT' and not line.startswith('Kind:') and not line.startswith('Language:'):
-                current_text.append(line)
-        elif not line and current_text:
-            # Empty line - end of caption block
-            text = ' '.join(current_text)
-            if text.strip():
-                entries.append({
-                    'text': text.strip(),
-                    'start': current_time,
-                    'end': current_time + 5
-                })
-            current_text = []
-            current_time = None
-
-    return entries
-
-
-def parse_xml(xml_text):
-    """Parse XML format captions"""
-    entries = []
-
-    try:
-        from xml.etree import ElementTree as ET
-
-        root = ET.fromstring(xml_text)
-
-        # Find all text elements
-        for item in root.findall('.//p'):
-            text = ''.join(item.itertext()).strip()
-            if text:
-                start = float(item.get('t', 0)) / 1000  # Convert to seconds
-                duration = float(item.get('d', 5000)) / 1000
-
-                entries.append({
-                    'text': text,
-                    'start': start,
-                    'end': start + duration
-                })
-    except Exception as e:
-        raise Exception(f"XML parsing failed: {str(e)}")
-
-    return entries
-
-
-def vtt_time_to_seconds(time_str):
-    """Convert VTT timestamp to seconds"""
-    try:
-        parts = time_str.replace(',', '.').split(':')
-        if len(parts) == 3:
-            hours, minutes, seconds = parts
-            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-        elif len(parts) == 2:
-            minutes, seconds = parts
-            return int(minutes) * 60 + float(seconds)
-    except:
-        pass
-    return 0
-
-
-def process_video(youtube_url):
-    """Main function to process YouTube video and extract captions"""
-
-    print("[*] Getting video ID...")
-    video_id = get_video_id(youtube_url)
-    print(f"[+] Video ID: {video_id}")
-
-    print("[*] Fetching captions...")
-
-    try:
-        # Fetch captions directly from YouTube
-        entries = fetch_captions_from_youtube(video_id)
-
-        if not entries or len(entries) == 0:
-            raise Exception("No caption entries found")
-
-        # Process entries
-        full_text = ' '.join([e['text'] for e in entries])
-        segments = [
-            {
-                'start': e['start'],
-                'end': e['end'],
-                'text': e['text']
-            }
-            for e in entries
-        ]
-
-        print(f"[+] {len(full_text)} characters fetched!")
-        print(f"[*] Preview: {full_text[:100]}...")
-
-        return {
-            "full_text": full_text,
-            "segments": segments
-        }
-
-    except Exception as e:
-        raise Exception(
-            f"Error extracting captions: {str(e)}"
+    size = os.path.getsize(audio_path)
+    if size > MAX_AUDIO_BYTES:
+        raise RuntimeError(
+            f"Audio is {size / 1e6:.1f} MB, above Groq's 25 MB limit. "
+            "Try a shorter video (roughly under 25-30 minutes)."
         )
 
+    from groq import Groq
 
-def parse_vtt(vtt_text):
-    """Parse VTT format captions"""
-    entries = []
-    lines = vtt_text.split('\n')
+    client = Groq(api_key=api_key)
+    print("[*] Transcribing with Groq Whisper...")
+    with open(audio_path, "rb") as f:
+        resp = client.audio.transcriptions.create(
+            file=(os.path.basename(audio_path), f.read()),
+            model=GROQ_WHISPER_MODEL,
+            response_format="verbose_json",
+        )
 
-    current_time = None
+    # The SDK may return an object or a dict depending on version.
+    raw_segments = getattr(resp, "segments", None)
+    if raw_segments is None and isinstance(resp, dict):
+        raw_segments = resp.get("segments")
+    text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else "")
+
+    segments = []
+    for seg in raw_segments or []:
+        get = seg.get if isinstance(seg, dict) else lambda k, d=None: getattr(seg, k, d)
+        segments.append({
+            "start": float(get("start", 0) or 0),
+            "end": float(get("end", 0) or 0),
+            "text": (get("text", "") or "").strip(),
+        })
+
+    if not segments and text:
+        segments = [{"start": 0.0, "end": 0.0, "text": text.strip()}]
+
+    result = _build_result(segments)
+    print(f"[+] Transcribed {len(result['full_text'])} characters")
+    return result
+
+
+def process_video(youtube_url: str) -> dict:
+    """LOCAL mode entry point: URL -> transcript dict."""
+    get_video_id(youtube_url)  # validates the URL early
+    with tempfile.TemporaryDirectory() as tmp:
+        audio_path = download_audio(youtube_url, tmp)
+        result = transcribe_with_groq(audio_path)
+
+    if not result["full_text"]:
+        raise RuntimeError("Transcription came back empty. Try another video.")
+    return result
+
+
+# --------------------------------------------------------------------------- #
+# HUGGINGFACE mode: parse a pasted YouTube transcript
+# --------------------------------------------------------------------------- #
+# Matches "0:05", "12:34", "1:02:03" at the start of a line, optionally followed by text.
+_TS_LINE = re.compile(r"^\s*\[?((?:\d{1,2}:)?\d{1,2}:\d{2})\]?\s*(.*)$")
+
+
+def _ts_to_seconds(ts: str) -> float:
+    parts = [int(p) for p in ts.split(":")]
+    seconds = 0
+    for p in parts:
+        seconds = seconds * 60 + p
+    return float(seconds)
+
+
+def parse_pasted_transcript(raw_text: str) -> dict:
+    """
+    Accepts the text copied from YouTube's "Show transcript" panel, in either layout:
+
+        0:00                         0:00 hello everyone
+        hello everyone      OR       0:04 today we will...
+        0:04
+        today we will...
+
+    Also accepts plain text with no timestamps (segments get start=0).
+    Ignores YouTube's "X seconds" / "X minutes, Y seconds" accessibility lines.
+    """
+    if not raw_text or not raw_text.strip():
+        raise ValueError("The pasted transcript is empty.")
+
+    noise = re.compile(r"^\d+\s+(hours?|minutes?|seconds?)(,\s*\d+\s+(minutes?|seconds?))*$", re.I)
+
+    segments = []
+    current_start = None
     current_text = []
 
-    for line in lines:
+    def flush():
+        if current_start is not None and current_text:
+            segments.append({
+                "start": current_start,
+                "end": current_start,
+                "text": " ".join(current_text).strip(),
+            })
+
+    for line in raw_text.splitlines():
         line = line.strip()
+        if not line or noise.match(line):
+            continue
+        m = _TS_LINE.match(line)
+        if m:
+            flush()
+            current_start = _ts_to_seconds(m.group(1))
+            current_text = [m.group(2)] if m.group(2) else []
+        else:
+            if current_start is None:
+                current_start = 0.0
+            current_text.append(line)
+    flush()
 
-        if '-->' in line:
-            # Parse timestamp
-            try:
-                start_str = line.split('-->')[0].strip()
-                start = vtt_time_to_seconds(start_str)
-                current_time = start
-            except:
-                pass
-        elif line and current_time is not None and '-->' not in line:
-            # This is caption text
-            if line != 'WEBVTT' and not line.startswith('Kind:') and not line.startswith('Language:'):
-                current_text.append(line)
-        elif not line and current_text:
-            # Empty line - end of caption block
-            text = ' '.join(current_text)
-            if text.strip():
-                entries.append({
-                    'text': text.strip(),
-                    'start': current_time,
-                    'end': current_time + 5
-                })
-            current_text = []
-            current_time = None
+    # Fill in end times from the next segment's start.
+    for i, seg in enumerate(segments):
+        nxt = segments[i + 1]["start"] if i + 1 < len(segments) else seg["start"] + 5
+        seg["end"] = max(nxt, seg["start"])
 
-    return entries
-
-
-def parse_xml(xml_text):
-    """Parse XML format captions"""
-    entries = []
-
-    try:
-        from xml.etree import ElementTree as ET
-
-        root = ET.fromstring(xml_text)
-
-        # Find all text elements
-        for item in root.findall('.//p'):
-            text = ''.join(item.itertext()).strip()
-            if text:
-                start = float(item.get('t', 0)) / 1000  # Convert to seconds
-                duration = float(item.get('d', 5000)) / 1000
-
-                entries.append({
-                    'text': text,
-                    'start': start,
-                    'end': start + duration
-                })
-    except Exception as e:
-        raise Exception(f"XML parsing failed: {str(e)}")
-
-    return entries
-
-
-def vtt_time_to_seconds(time_str):
-    """Convert VTT timestamp to seconds"""
-    try:
-        parts = time_str.replace(',', '.').split(':')
-        if len(parts) == 3:
-            hours, minutes, seconds = parts
-            return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
-        elif len(parts) == 2:
-            minutes, seconds = parts
-            return int(minutes) * 60 + float(seconds)
-    except:
-        pass
-    return 0
-
-
-def process_video(youtube_url):
-    """Main function to process YouTube video and extract captions"""
-
-    print("[*] Getting video ID...")
-    video_id = get_video_id(youtube_url)
-    print(f"[+] Video ID: {video_id}")
-
-    print("[*] Fetching captions...")
-
-    try:
-        # Fetch captions directly from YouTube
-        entries = fetch_captions_from_youtube(video_id)
-
-        if not entries:
-            raise Exception("No caption entries found")
-
-        # Process entries
-        full_text = ' '.join([e['text'] for e in entries])
-        segments = [
-            {
-                'start': e['start'],
-                'end': e['end'],
-                'text': e['text']
-            }
-            for e in entries
-        ]
-
-        print(f"[+] {len(full_text)} characters fetched!")
-        print(f"[*] Preview: {full_text[:200]}")
-
-        return {
-            "full_text": full_text,
-            "segments": segments
-        }
-
-    except Exception as e:
-        error_msg = str(e).lower()
-        raise Exception(
-            f"Error extracting captions: {str(e)}"
-        )
+    result = _build_result(segments)
+    if not result["full_text"]:
+        raise ValueError("Couldn't find any transcript text in what you pasted.")
+    return result

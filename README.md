@@ -35,7 +35,8 @@ Simply paste a YouTube link and it automatically transcribes the audio, generate
 | Python 3.13 | Core programming language |
 | Streamlit | Web interface |
 | Requests | HTTP requests for caption fetching |
-| Groq LLaMA (llama-3.1-8b-instant) | Notes & summary generation |
+| Groq `openai/gpt-oss-20b` (configurable via `GROQ_MODEL`) | Notes & summary generation |
+| Groq Whisper (`whisper-large-v3-turbo`) | Audio transcription |
 | python-dotenv | API key management |
 
 ---
@@ -64,6 +65,8 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 ```
 GROQ_API_KEY=your_groq_api_key_here
+# Optional: override default chat model (defaults to openai/gpt-oss-20b)
+GROQ_MODEL=openai/gpt-oss-20b
 ```
 Get your free API key at 👉 [console.groq.com](https://console.groq.com)
 
@@ -76,6 +79,17 @@ streamlit run app.py
 ```
 http://localhost:8501
 ```
+
+---
+
+## 🔧 Troubleshooting
+
+### `model_not_found` or Decommissioned Model Error
+If you see an error like:
+```
+Error code: 404 - {'error': {'message': 'The model ... does not exist or you do not have access to it.', 'code': 'model_not_found'}}
+```
+Groq periodically updates its free tier model lineup. Set `GROQ_MODEL` in your `.env` (or Hugging Face Space secrets/variables) to an active model from [console.groq.com/docs/models](https://console.groq.com/docs/models) (e.g. `openai/gpt-oss-20b`).
 
 ---
 
