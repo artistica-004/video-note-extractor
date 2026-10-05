@@ -3,3 +3,4 @@ venv/
 __pycache__/
 audio.*
 *.pyc
+project_info.txt
